@@ -64,25 +64,26 @@ class QuantumStockPredictor:
         Returns:
             qml.ExpvalCost: Quantum expectation value
         """
-        @qml.qnode(self.dev)
+        @qml.qnode(self.dev, interface="torch")
         def circuit(inputs, weights):
             # Feature encoding using angle encoding
-            for i in range(self.n_qubits):
-                qml.RY(inputs[i % len(inputs)], wires=i)
+            for i in range(min(self.n_qubits, len(inputs))):
+                qml.RY(inputs[i], wires=i)
             
             # Variational layers
             for layer in range(self.n_layers):
-                # Entangling layer
+                # Entangling layer - create entanglement between qubits
                 for i in range(self.n_qubits - 1):
                     qml.CNOT(wires=[i, i + 1])
-                qml.CNOT(wires=[self.n_qubits - 1, 0])
+                if self.n_qubits > 2:
+                    qml.CNOT(wires=[self.n_qubits - 1, 0])
                 
-                # Rotation layer
+                # Rotation layer with trainable parameters
                 for i in range(self.n_qubits):
                     qml.RY(weights[layer, i, 0], wires=i)
                     qml.RZ(weights[layer, i, 1], wires=i)
             
-            # Measurement
+            # Measurement - measure expectation value of PauliZ on first qubit
             return qml.expval(qml.PauliZ(0))
         
         return circuit
@@ -128,7 +129,7 @@ class QuantumStockPredictor:
     
     def forward(self, x):
         """
-        Forward pass through the hybrid model.
+        Forward pass through the hybrid model with actual quantum circuit execution.
         
         Args:
             x: Input features
@@ -139,29 +140,43 @@ class QuantumStockPredictor:
         # Classical encoding
         encoded_features = self.classical_encoder(x)
         
-        # Quantum processing - simplified approach
-        # Use the encoded features directly with some quantum-inspired transformations
+        # Quantum processing - actual quantum circuit execution
         batch_size = encoded_features.shape[0]
+        quantum_outputs = []
         
-        # Apply quantum-inspired transformations
-        # Simulate quantum interference and entanglement effects
-        quantum_features = torch.zeros(batch_size, 1, device=self.device)
+        # Get quantum weights
+        q_weights = self.quantum_weights.detach().cpu().numpy()
         
         for i in range(batch_size):
             # Get encoded features for this sample
-            features = encoded_features[i]
+            features = encoded_features[i].detach().cpu().numpy()
             
-            # Apply quantum-inspired transformations
-            # Simulate quantum interference
-            interference = torch.sum(torch.sin(features * self.quantum_weights[0, 0, 0]))
-            entanglement = torch.sum(torch.cos(features * self.quantum_weights[0, 0, 1]))
+            # Prepare inputs for quantum circuit (normalize to [0, 2π])
+            q_inputs = np.array(features[:self.n_qubits])  # Take first n_qubits features
             
-            # Combine quantum effects
-            quantum_output = interference + entanglement
-            quantum_features[i, 0] = quantum_output
+            # Normalize inputs to [0, 2π] range
+            if len(q_inputs) > 0:
+                q_inputs = (q_inputs - np.min(q_inputs)) / (np.max(q_inputs) - np.min(q_inputs) + 1e-8)
+                q_inputs = q_inputs * 2 * np.pi  # Scale to [0, 2π]
+            
+            # Run actual quantum circuit
+            try:
+                # Execute the quantum circuit
+                q_output = self.quantum_circuit(q_inputs, q_weights)
+                quantum_outputs.append(float(q_output))
+            except Exception as e:
+                # Fallback to classical processing if quantum circuit fails
+                print(f"Quantum circuit failed for sample {i}, using classical fallback: {e}")
+                # Use a simple classical transformation as fallback
+                q_output = np.sum(np.sin(q_inputs)) + np.sum(np.cos(q_inputs))
+                quantum_outputs.append(float(q_output))
+        
+        # Convert quantum outputs to tensor
+        quantum_tensor = torch.tensor(quantum_outputs, dtype=torch.float32, device=self.device)
+        quantum_tensor = quantum_tensor.unsqueeze(1)  # Add dimension for decoder
         
         # Classical decoding
-        output = self.classical_decoder(quantum_features)
+        output = self.classical_decoder(quantum_tensor)
         
         return output
     
