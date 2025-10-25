@@ -4,6 +4,10 @@
 
 This project implements a hybrid quantum-classical machine learning model for predicting stock index closing prices using quantum computing principles.
 
+## 📹 Project Demo Video
+
+Watch our project demonstration: [Quantum Stock Price Prediction Demo](https://youtu.be/sC6NYvDP6bo)
+
 ## 📋 Project Overview
 
 The goal is to build a quantum machine learning model that predicts future stock index closing prices based on historical data. The model incorporates quantum circuits for feature processing and combines them with classical neural networks.
