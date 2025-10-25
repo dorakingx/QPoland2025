@@ -67,16 +67,14 @@ class QuantumStockPredictor:
         @qml.qnode(self.dev, interface="torch")
         def circuit(inputs, weights):
             # Feature encoding using angle encoding
-            for i in range(min(self.n_qubits, len(inputs))):
+            for i in range(self.n_qubits):
                 qml.RY(inputs[i], wires=i)
             
-            # Variational layers
+            # Simplified variational layer
             for layer in range(self.n_layers):
-                # Entangling layer - create entanglement between qubits
+                # Light entangling - only connect adjacent qubits
                 for i in range(self.n_qubits - 1):
                     qml.CNOT(wires=[i, i + 1])
-                if self.n_qubits > 2:
-                    qml.CNOT(wires=[self.n_qubits - 1, 0])
                 
                 # Rotation layer with trainable parameters
                 for i in range(self.n_qubits):
@@ -84,13 +82,14 @@ class QuantumStockPredictor:
                     qml.RZ(weights[layer, i, 1], wires=i)
             
             # Measurement - measure expectation value of PauliZ on first qubit
+            # For now, use single measurement to ensure compatibility
             return qml.expval(qml.PauliZ(0))
         
         return circuit
     
     def create_model(self, input_dim, output_dim):
         """
-        Create the hybrid quantum-classical model.
+        Create the hybrid quantum-classical model using PennyLane TorchLayer.
         
         Args:
             input_dim (int): Input feature dimension
@@ -104,32 +103,38 @@ class QuantumStockPredictor:
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(32, self.n_qubits)
+            nn.Linear(32, self.n_qubits),
+            nn.Sigmoid()  # Output in [0,1] range for quantum encoding
         )
         
-        # Quantum circuit
+        # Quantum circuit (qnode)
         self.quantum_circuit = self.create_quantum_circuit()
+        
+        # Convert qnode to TorchLayer for proper gradient flow
+        weight_shapes = {"weights": (self.n_layers, self.n_qubits, 2)}
+        self.q_layer = qml.qnn.TorchLayer(self.quantum_circuit, weight_shapes)
+        
+        # Initialize quantum layer weights
+        for param in self.q_layer.parameters():
+            param.data *= 0.1
         
         # Classical decoder (output processing)
         self.classical_decoder = nn.Sequential(
-            nn.Linear(1, 16),
+            nn.Linear(1, 16),  # Back to 1 for single measurement
             nn.ReLU(),
             nn.Linear(16, 8),
             nn.ReLU(),
             nn.Linear(8, output_dim)
         )
         
-        # Initialize quantum weights
-        self.quantum_weights = torch.randn(self.n_layers, self.n_qubits, 2, 
-                                        requires_grad=True, device=self.device)
-        
         # Move classical components to device
         self.classical_encoder = self.classical_encoder.to(self.device)
         self.classical_decoder = self.classical_decoder.to(self.device)
+        self.q_layer = self.q_layer.to(self.device)
     
     def forward(self, x):
         """
-        Forward pass through the hybrid model with actual quantum circuit execution.
+        Forward pass through the hybrid model with proper gradient flow.
         
         Args:
             x: Input features
@@ -137,46 +142,38 @@ class QuantumStockPredictor:
         Returns:
             Predicted stock prices
         """
-        # Classical encoding
+        # Classical encoding (output in [0,1] range)
         encoded_features = self.classical_encoder(x)
         
-        # Quantum processing - actual quantum circuit execution
-        batch_size = encoded_features.shape[0]
+        # Scale to [0, 2π] for quantum encoding
+        quantum_inputs = encoded_features * 2 * np.pi
+        
+        # Quantum processing - manual implementation to ensure gradient flow
+        batch_size = quantum_inputs.shape[0]
         quantum_outputs = []
         
-        # Get quantum weights
-        q_weights = self.quantum_weights.detach().cpu().numpy()
-        
         for i in range(batch_size):
-            # Get encoded features for this sample
-            features = encoded_features[i].detach().cpu().numpy()
+            # Get inputs for this sample
+            inputs = quantum_inputs[i]
             
-            # Prepare inputs for quantum circuit (normalize to [0, 2π])
-            q_inputs = np.array(features[:self.n_qubits])  # Take first n_qubits features
-            
-            # Normalize inputs to [0, 2π] range
-            if len(q_inputs) > 0:
-                q_inputs = (q_inputs - np.min(q_inputs)) / (np.max(q_inputs) - np.min(q_inputs) + 1e-8)
-                q_inputs = q_inputs * 2 * np.pi  # Scale to [0, 2π]
-            
-            # Run actual quantum circuit
+            # Run quantum circuit with gradient tracking
             try:
-                # Execute the quantum circuit
-                q_output = self.quantum_circuit(q_inputs, q_weights)
-                quantum_outputs.append(float(q_output))
+                # Execute quantum circuit
+                q_output = self.quantum_circuit(inputs, self.q_layer.weights)
+                quantum_outputs.append(q_output)
             except Exception as e:
                 # Fallback to classical processing if quantum circuit fails
                 print(f"Quantum circuit failed for sample {i}, using classical fallback: {e}")
                 # Use a simple classical transformation as fallback
-                q_output = np.sum(np.sin(q_inputs)) + np.sum(np.cos(q_inputs))
-                quantum_outputs.append(float(q_output))
+                q_output = torch.sum(torch.sin(inputs)) + torch.sum(torch.cos(inputs))
+                quantum_outputs.append(q_output)
         
-        # Convert quantum outputs to tensor
-        quantum_tensor = torch.tensor(quantum_outputs, dtype=torch.float32, device=self.device)
-        quantum_tensor = quantum_tensor.unsqueeze(1)  # Add dimension for decoder
+        # Stack quantum outputs and ensure correct dtype
+        quantum_output = torch.stack(quantum_outputs).float()
+        quantum_output = quantum_output.unsqueeze(1)
         
         # Classical decoding
-        output = self.classical_decoder(quantum_tensor)
+        output = self.classical_decoder(quantum_output)
         
         return output
     
@@ -207,9 +204,9 @@ class QuantumStockPredictor:
             ma_10 = df['Close'].rolling(window=10).mean()
             ma_20 = df['Close'].rolling(window=20).mean()
             
-            features.append(ma_5.fillna(df['Close']).values)
-            features.append(ma_10.fillna(df['Close']).values)
-            features.append(ma_20.fillna(df['Close']).values)
+            features.append(ma_5.fillna(method='bfill').values)
+            features.append(ma_10.fillna(method='bfill').values)
+            features.append(ma_20.fillna(method='bfill').values)
             
             # Price ratios
             features.append((df['High'] / df['Low']).values)
@@ -268,10 +265,22 @@ class QuantumStockPredictor:
         dataset = TensorDataset(self.X_train_tensor, self.y_train_tensor)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
-        # Initialize optimizer
-        classical_params = list(self.classical_encoder.parameters()) + list(self.classical_decoder.parameters())
-        quantum_params = [self.quantum_weights]
-        self.optimizer = optim.Adam(classical_params + quantum_params, lr=learning_rate)
+        # Initialize optimizer with different learning rates for classical and quantum parts
+        classical_enc_params = list(self.classical_encoder.parameters())
+        classical_dec_params = list(self.classical_decoder.parameters())
+        quantum_params = list(self.q_layer.parameters())
+        
+        # Use different learning rates for classical and quantum components
+        param_groups = [
+            {'params': classical_enc_params + classical_dec_params, 'lr': learning_rate},
+            {'params': quantum_params, 'lr': learning_rate * 0.1}  # Lower learning rate for quantum
+        ]
+        self.optimizer = optim.Adam(param_groups)
+        
+        # Add learning rate scheduler for better convergence
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=10
+        )
         
         # Loss function
         criterion = nn.MSELoss()
@@ -299,6 +308,9 @@ class QuantumStockPredictor:
             
             avg_loss = epoch_loss / len(dataloader)
             train_losses.append(avg_loss)
+            
+            # Update learning rate scheduler
+            self.scheduler.step(avg_loss)
             
             if (epoch + 1) % 10 == 0:
                 print(f'Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.6f}')
@@ -350,9 +362,9 @@ class QuantumStockPredictor:
             ma_10 = df['Close'].rolling(window=10).mean()
             ma_20 = df['Close'].rolling(window=20).mean()
             
-            features.append(ma_5.fillna(df['Close']).values)
-            features.append(ma_10.fillna(df['Close']).values)
-            features.append(ma_20.fillna(df['Close']).values)
+            features.append(ma_5.fillna(method='bfill').values)
+            features.append(ma_10.fillna(method='bfill').values)
+            features.append(ma_20.fillna(method='bfill').values)
             
             # Price ratios
             features.append((df['High'] / df['Low']).values)
@@ -434,7 +446,7 @@ def main():
     print(f"Training data shape: {X_train.shape}")
     print(f"Test data shape: {X_test.shape}")
     
-    # Initialize the quantum model
+    # Initialize the quantum model with improved architecture
     print("\nInitializing quantum model...")
     model = QuantumStockPredictor(n_qubits=4, n_layers=2, device='cpu')
     
@@ -449,7 +461,7 @@ def main():
     
     # Train the model
     print("\nTraining quantum model...")
-    train_losses = model.train(epochs=50, batch_size=16, learning_rate=0.01)
+    train_losses = model.train(epochs=100, batch_size=8, learning_rate=0.001)
     
     # Make predictions on test data
     print("\nMaking predictions...")
